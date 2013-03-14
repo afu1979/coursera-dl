@@ -21,16 +21,18 @@ class CourseraDownloader(object):
     LECTURE_URL = BASE_URL + '/lecture/index'
     LOGIN_URL =   BASE_URL + '/auth/auth_redirector?type=login&subtype=normal'
     QUIZ_URL =    BASE_URL + '/quiz/index'
+    ASSIGNMENT_URL = BASE_URL + '/assignment/index'
 
     DEFAULT_PARSER = "lxml"
 
-    def __init__(self,username,password,parser=DEFAULT_PARSER):
+    def __init__(self,username,password, quiz, parser=DEFAULT_PARSER):
         """Requires your coursera username and password. 
         You can also specify the parser to use (defaults to lxml), see http://www.crummy.com/software/BeautifulSoup/bs4/doc/#installing-a-parser
         """
         self.username = username
         self.password = password
         self.parser = parser
+        self.quiz = quiz
 
         self.browser = Browser()
         self.browser.set_handle_robots(False)
@@ -206,15 +208,34 @@ class CourseraDownloader(object):
         self.download(self.HOME_URL % cname,target_dir=course_dir,target_fname="index.html")
         self.download(course_url,target_dir=course_dir,target_fname="lectures.html")
 
-        # commented out because of https://github.com/dgorissen/coursera-dl/issues/2
-        # self.download((self.BASE_URL + '/wiki/view?page=syllabus') % cname, target_dir=course_dir,target_fname="syllabus.html")
-        # download the quizzes & homeworks
-        #for qt in ['quiz','homework']:
-        #    print "  - Downloading the '%s' quizzes" % qt
-        #    try:
-        #        self.download_quizzes(cname,course_dir,quiz_type=qt)
-        #    except Exception as e:
-        #        print "  - Failed %s" % e
+        #search for wiki static pages in navigation and save
+        p = self.browser.open(self.HOME_URL % cname)
+        bs = BeautifulSoup(p,self.parser)
+
+        qlist = bs.find('ul',{'class':'course-navbar-list'})
+        qurls = [q['href'] for q in qlist.findAll('a')]
+        qurls = [h for h in qurls if "page=" in h]        
+        for url in qurls:
+            filename = url.partition("/wiki/view?page=")[2]
+            if not filename.endswith("html"):
+                filename = filename + ".html"
+                self.download(url,target_dir=course_dir,target_fname=filename)
+
+
+        #download assignments
+        self.download_assignments(cname,course_dir)
+        
+        # download the quizzes & homework if quiz flag is set in startup.
+        
+        if self.quiz:
+            for qt in ['quiz','homework']:
+                print "  - Downloading the '%s' quizzes" % qt
+                try:
+                    self.download_quizzes(cname,course_dir,quiz_type=qt)
+                except Exception as e:
+                   print "  - Failed %s" % e
+
+        
 
         # now download the actual content (video's, lecture notes, ...)
         for j,weeklyTopic in enumerate(weeklyTopics,start=1):
@@ -246,7 +267,7 @@ class CourseraDownloader(object):
                 if not os.path.exists(clsdir): 
                     os.makedirs(clsdir)
 
-                print "  - Downloading resources for " + className
+                print "  - ources for " + className
 
                 for classResource,tfname in classResources:
                     if not isValidURL(classResource):
@@ -274,12 +295,66 @@ class CourseraDownloader(object):
         p = self.browser.open(qurl)
         bs = BeautifulSoup(p,self.parser)
 
-        qlist = bs.find('div',{'class':'item_list'})
-        qurls = [q['href'].replace('/start?','/attempt?') for q in qlist.findAll('a',{'class':'btn primary'})]
-        titles = [t.string for t in qlist.findAll('h4')]
-
+        qlist = bs.find('div',{'class':'course-item-list'})
+        qurls = [q['href'].replace('/start?','/attempt?') for q in qlist.findAll('a',{'class':'btn-primary'})]
+        titles = [t.string for t in qlist.find_all('h4')]
+        
+        #check to see if any URLs found before creating directory.
+        if not qurls:
+            return
+        
         # ensure the target directory exists
         dir = os.path.join(target_dir,quiz_type)
+
+        try:
+            os.makedirs(dir)
+        except OSError as e:
+            if e.errno == errno.EEXIST:
+                pass
+            else: raise
+
+        # download each quiz
+        for i,it in enumerate(zip(qurls,titles),start=1):
+            q,t = it
+            fname = os.path.join(dir,str(i).zfill(2) + " - " + sanitiseFileName(t) + ".html")
+            
+            if os.path.exists(fname):
+                pass
+                #print "  - already exists, skipping"
+            else:
+                quiz = self.browser.open(q)
+                bs = BeautifulSoup(quiz,self.parser)
+                startform = bs.findAll("form", {"class":"course-quiz-start-form"})
+                if startform:
+                    print "Starting and Downloading Quiz"
+                    self.browser.select_form(nr=0)
+                    r = self.browser.submit()
+                    content = r.read()
+                    with open(fname, "w") as f:
+                        f.write(content)
+                    
+                else:   
+                    print "Downloading Quiz" 
+                    self.browser.retrieve(q,fname)
+
+    def download_assignments(self,course,target_dir):
+        """Download each of the assignments as separate html files"""
+
+        # extract the list of all assignments
+        qurl = (self.ASSIGNMENT_URL) % course
+        p = self.browser.open(qurl)
+        bs = BeautifulSoup(p,self.parser)
+
+        qlist = bs.find('div',{'class':'course-item-list'})
+        qurls = [q['href'] for q in qlist.findAll('a',{'class':'btn-primary'})]
+        titles = [t.string for t in qlist.find_all('h4')]
+        
+        #check to see if any URLs found before creating directory.
+        if not qurls:
+            return
+
+        # ensure the target directory exists
+        dir = os.path.join(target_dir,"assignments")
 
         try:
             os.makedirs(dir)
@@ -292,10 +367,12 @@ class CourseraDownloader(object):
         for i,it in enumerate(zip(qurls,titles),start=1):
             q,t = it
             fname = os.path.join(dir,str(i).zfill(2) + " - " + sanitiseFileName(t) + ".html")
+            
             if os.path.exists(fname):
                 pass
                 #print "  - already exists, skipping"
             else:
+                #print "Found assignment" 
                 self.browser.retrieve(q,fname)
 
     @staticmethod
@@ -354,11 +431,14 @@ def sanitiseFileName(fileName):
     # split off extension, trim, and re-add the extension
     fn,ext = os.path.splitext(s)
     s = fn[:max-len(ext)] + ext
-
     return s
 
 def isValidURL(url):
     return url.startswith('http') or url.startswith('https')
+
+def path2url(path):
+    return urlparse.urljoin(
+      'file:', urllib.pathname2url(path))
 
 class AbsoluteURLGen(object):
     """
@@ -427,6 +507,7 @@ def main():
     parser.add_argument("-d", dest='dest_dir', type=str, default=".", help='destination directory where everything will be saved')
     parser.add_argument("-q", dest='parser', type=str, default=CourseraDownloader.DEFAULT_PARSER,
                         help="the html parser to use, see http://www.crummy.com/software/BeautifulSoup/bs4/doc/#installing-a-parser")
+    parser.add_argument("--quiz", dest='quiz', action="store_true", default=False, help="Allow downloading of quizzes. May trigger quiz attempts")
     parser.add_argument('course_names', nargs="+", metavar='<course name>',
                         type=str, help='one or more course names (from the url)')
     args = parser.parse_args()
@@ -446,7 +527,7 @@ def main():
         args.password = getpass.getpass()
 
     # instantiate the downloader class
-    d = CourseraDownloader(args.username,args.password,parser=parser)
+    d = CourseraDownloader(args.username,args.password,args.quiz,parser=parser)
 
     # download the content
     for cn in args.course_names:
